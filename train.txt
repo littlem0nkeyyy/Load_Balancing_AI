@@ -1,0 +1,141 @@
+import pandas as pd
+import numpy as np
+import joblib
+import datetime
+import time
+import os
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+from collections import deque
+
+class IntegratedAILoadBalancer:
+    def __init__(self, total_servers=5):
+        self.total_servers = total_servers
+        self.active_count = 1
+        self.model = None
+        self.scaler = StandardScaler()
+        self.decision_history = deque(maxlen=5)
+        
+        # Bản đồ độ nhạy (Sẽ được học từ dữ liệu)
+        self.hourly_sensitivity = {h: 0.4 for h in range(24)}
+        
+        # File lưu trữ
+        self.model_path = 'final_lb_model.pkl'
+        self.scaler_path = 'final_scaler.pkl'
+        self.map_path = 'sensitivity_map.pkl'
+
+    # ---------------------------------------------------------
+    # GIAI ĐOẠN 1: TỰ HỌC TỪ DỮ LIỆU (LEARNING PHASE)
+    # ---------------------------------------------------------
+    def train_and_learn_peak_hours(self, csv_file):
+        """Đọc dữ liệu, học Peak Hour từ Timestamp và train Model"""
+        print(f"[*] Đang xử lý dữ liệu từ {csv_file}...")
+        df = pd.read_csv(csv_file)
+        
+        # Chuyển timestamp và học quy luật giờ cao điểm
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df['hour'] = df['timestamp'].dt.hour
+        
+        # Tính xác suất quá tải thực tế cho mỗi giờ
+        # 'target' = 1 là lúc hệ thống bị quá tải trong quá khứ
+        prob_per_hour = df.groupby('hour')['target'].mean()
+        
+        for h in range(24):
+            p = prob_per_hour.get(h, 0)
+            if p > 0.6: self.hourly_sensitivity[h] = 0.2   # Giờ cực nóng: Cực nhạy
+            elif p > 0.3: self.hourly_sensitivity[h] = 0.3 # Giờ nóng vừa: Nhạy
+            else: self.hourly_sensitivity[h] = 0.5         # Giờ thấp điểm: An toàn
+        
+        # Huấn luyện mô hình Random Forest
+        features = [
+            'total_requests', 'total_errors', 'total_connections', 'jobs_processed',
+            'cpu_usage', 'ram_usage', 'current_connections', 'queue_length',
+            'request_latency', 'response_size', 'processing_time'
+        ]
+        X = df[features]
+        y = df['target']
+        
+        X_scaled = self.scaler.fit_transform(X)
+        self.model = RandomForestClassifier(n_estimators=200, class_weight={0: 1, 1: 5}, random_state=42)
+        self.model.fit(X_scaled, y)
+        
+        # Lưu kết quả học tập
+        joblib.dump(self.model, self.model_path)
+        joblib.dump(self.scaler, self.scaler_path)
+        joblib.dump(self.hourly_sensitivity, self.map_path)
+        print("[+] Hoàn tất học tập từ lịch sử!")
+
+    # ---------------------------------------------------------
+    # GIAI ĐOẠN 2: RA QUYẾT ĐỊNH THỜI GIAN THỰC (OPERATION PHASE)
+    # ---------------------------------------------------------
+    def load_trained_data(self):
+        """Tải dữ liệu đã học"""
+        if os.path.exists(self.model_path):
+            self.model = joblib.load(self.model_path)
+            self.scaler = joblib.load(self.scaler_path)
+            self.hourly_sensitivity = joblib.load(self.map_path)
+            return True
+        return False
+
+    def get_realtime_action(self, metrics):
+        """AI phân tích và đưa ra hành động cụ thể"""
+        current_hour = datetime.datetime.now().hour
+        threshold = self.hourly_sensitivity.get(current_hour, 0.4)
+        
+        # Dự đoán xác suất
+        metrics_scaled = self.scaler.transform([metrics])
+        prob_overload = self.model.predict_proba(metrics_scaled)[0][1]
+        
+        # Bỏ phiếu để tránh nhiễu (Windowing)
+        vote = 1 if prob_overload > threshold else 0
+        self.decision_history.append(vote)
+        
+        print(f"[{current_hour}h] Xác suất: {prob_overload:.2f} | Ngưỡng nhạy: {threshold}")
+
+        if sum(self.decision_history) >= 3: # Đa số phiếu bầu là 1
+            return "SCALE_UP"
+        elif sum(self.decision_history) == 0: # Tất cả phiếu bầu là 0
+            return "SCALE_DOWN"
+        return "STAY"
+
+# ---------------------------------------------------------
+# GIAI ĐOẠN 3: THỰC THI LỆNH HẠ TẦNG (EXECUTION PHASE)
+# ---------------------------------------------------------
+def scale_infrastructure(action, lb_instance):
+    """Hàm thực thi lệnh bật/tắt server thực tế"""
+    if action == "SCALE_UP" and lb_instance.active_count < lb_instance.total_servers:
+        lb_instance.active_count += 1
+        print(f"==> [BẬT] Kích hoạt server thứ {lb_instance.active_count}")
+        # Lệnh thực tế: os.system("ssh server_n systemctl start app")
+        
+    elif action == "SCALE_DOWN" and lb_instance.active_count > 1:
+        print(f"==> [TẮT] Ngắt server thứ {lb_instance.active_count}")
+        lb_instance.active_count -= 1
+        # Lệnh thực tế: os.system("ssh server_n systemctl stop app")
+
+# =========================================================
+# CHẠY CHƯƠNG TRÌNH
+# =========================================================
+if __name__ == "__main__":
+    lb = IntegratedAILoadBalancer(total_servers=5)
+
+    # 1. Huấn luyện (Chạy 1 lần đầu tiên nếu bạn có file CSV)
+    # lb.train_and_learn_peak_hours('du_lieu_cua_ban.csv')
+
+    # 2. Vòng lặp điều khiển tự động
+    if lb.load_trained_data():
+        print("[System Ready] AI đang điều phối 5 server...")
+        try:
+            while True:
+                # Giả lập 11 thông số lấy từ hệ thống (Real-time)
+                # Requests, Errors, Conns, Jobs, CPU, RAM, Curr_Conns, Queue, Latency, Size, Time
+                current_stats = [6000, 1, 250, 5800, 85.0, 72.0, 180, 25, 450, 1024, 300]
+                
+                decision = lb.get_realtime_action(current_stats)
+                scale_infrastructure(decision, lb)
+                
+                time.sleep(10) # Quét mỗi 10 giây
+        except KeyboardInterrupt:
+            print("[Stop] Đã dừng hệ thống.")
+    else:
+        print("[Error] Không tìm thấy dữ liệu đã huấn luyện. Hãy chạy Train trước!")
