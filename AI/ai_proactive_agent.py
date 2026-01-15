@@ -13,6 +13,9 @@ class AIProactiveAgent:
         self.last_action = "STAY"  # Biến chia sẻ để Adaptive biết Decision vừa làm gì
         self.lock = threading.Lock() # Khóa an toàn để tránh xung đột khi 2 luồng cùng truy cập AI Brain
 
+        self.protected_servers = [
+            "http://130.94.65.44:8081"
+        ]
     def get_lbs_status_connection(self):
 
         try:
@@ -56,6 +59,7 @@ class AIProactiveAgent:
                 current_action = "STAY"
 
                 for s_info in servers_data:
+                    s_url = s_info['url']
                     h = s_info['health']
                     # Mapping dữ liệu LBS sang định dạng AI học
                     metrics = [0, 0, 0, h['cpuUsagePercent'], h['memoryUsagePercent'], 
@@ -70,15 +74,19 @@ class AIProactiveAgent:
 
                     # Logic ra lệnh
                     cmd_action = None
+
                     if is_overload:
                         cmd_action = "OPEN_SERVER"
                     elif h['cpuUsagePercent'] < current_idle_threshold:
-                        cmd_action = "CLOSE_SERVER"
+                        if s_url in self.protected_servers: 
+                            cmd_action = None
+                        else: 
+                            cmd_action = "CLOSE_SERVER"
 
                     # Gửi lệnh ngay trên socket đang mở
                     if cmd_action:
                         current_action = cmd_action
-                        self.send_command(s_conn, cmd_action, s_info['url'])
+                        self.send_command(s_conn, cmd_action, s_url)
                         print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Decision: {cmd_action} -> {s_info['url']}")
 
                 # Cập nhật hành động cuối để luồng Adaptive tham khảo
