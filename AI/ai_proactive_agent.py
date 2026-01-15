@@ -14,7 +14,7 @@ class AIProactiveAgent:
         self.lock = threading.Lock() # Khóa an toàn để tránh xung đột khi 2 luồng cùng truy cập AI Brain
 
         self.protected_servers = [
-            "http://130.94.65.44:8081"
+            "130.94.65.44:8081"
         ]
     def get_lbs_status_connection(self):
 
@@ -61,6 +61,7 @@ class AIProactiveAgent:
                 for s_info in servers_data:
                     s_url = s_info['url']
                     h = s_info['health']
+
                     # Mapping dữ liệu LBS sang định dạng AI học
                     metrics = [0, 0, 0, h['cpuUsagePercent'], h['memoryUsagePercent'], 
                                h['currConnections'], 0, 0, h['avgProcessingTimeSec'], 0]
@@ -78,7 +79,8 @@ class AIProactiveAgent:
                     if is_overload:
                         cmd_action = "OPEN_SERVER"
                     elif h['cpuUsagePercent'] < current_idle_threshold:
-                        if s_url in self.protected_servers: 
+                        is_protected = any(pid in s_url for pid in self.protected_servers)
+                        if is_protected:
                             cmd_action = None
                         else: 
                             cmd_action = "CLOSE_SERVER"
