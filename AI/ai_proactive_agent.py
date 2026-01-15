@@ -105,7 +105,7 @@ class AIProactiveAgent:
         
         while True:
             # Ngủ 300 giây (5 phút) trước khi bắt đầu học
-            time.sleep(300)
+            time.sleep(60)
             
             print(f"\n[{datetime.datetime.now().strftime('%H:%M:%S')}] --- BẮT ĐẦU TỰ HỌC ---")
             
