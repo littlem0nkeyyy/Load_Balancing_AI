@@ -9,140 +9,160 @@ from config import *
 
 class AIProactiveAgent:
     def __init__(self):
+        print("[INIT] Khởi tạo AI Agent...")
         self.brain = AIBrain()
-        self.last_action = "STAY"  # Biến chia sẻ để Adaptive biết Decision vừa làm gì
-        self.lock = threading.Lock() # Khóa an toàn để tránh xung đột khi 2 luồng cùng truy cập AI Brain
+        self.last_action = "STAY"
+        self.lock = threading.Lock()
 
-        self.protected_servers = [
-            "130.94.65.44:8081"
+        # DANH SÁCH BẢO VỆ (IP hoặc Port)
+        # Bất kỳ URL nào chứa chuỗi này sẽ KHÔNG BAO GIỜ bị tắt
+        self.protected_identity = [
+            "130.94.65.44:8081",
+            "8081" # Bảo vệ thêm port cho chắc
         ]
-    def get_lbs_status_connection(self):
 
+    # --- HÀM 1: KẾT NỐI (UTILITY) ---
+    def get_lbs_status_connection(self):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(5)
             s.connect((LBS_HOST, LBS_PORT))
 
-            # Gửi lệnh lấy dữ liệu
             cmd = json.dumps({"action": "GET_STATUS"}).encode('utf-8')
             s.sendall(struct.pack('>I', len(cmd)) + cmd)
 
-            # Nhận header độ dài (4 bytes)
             raw_len = self.recvall(s, 4)
             if not raw_len: 
                 s.close()
                 return None, None
             
-            # Nhận nội dung JSON
             msglen = struct.unpack('>I', raw_len)[0]
             data_raw = self.recvall(s, msglen).decode('utf-8')
-            payload = json.loads(data_raw)
-
-            # Trả về cả payload và socket (để decision_cycle dùng socket này gửi lệnh tiếp nếu cần)
-            return payload, s
-        
+            return json.loads(data_raw), s
         except Exception as e:
-            print(f"[!] Lỗi kết nối LBS: {e}")
+            # print(f"[!] Kết nối LBS thất bại: {e}")
             return None, None
 
-
+    # --- HÀM 2: LUỒNG DECISION (10s) ---
     def decision_cycle(self):
-        """Luồng chạy liên tục 10s/lần để ra lệnh đóng mở server"""
-        print("[*] Luồng Decision (10s) đã khởi động...")
+        print("[*] Luồng Decision (10s) đã sẵn sàng.")
         
         while True:
-            # 1. Gọi hàm chung để lấy dữ liệu (Kết nối độc lập A)
             payload, s_conn = self.get_lbs_status_connection()
             
             if payload and s_conn:
                 servers_data = payload.get('servers', [])
                 current_action = "STAY"
+                
+                # Tìm danh sách server đang TẮT (để dành cứu viện)
+                # Giả định LBS trả về 'isOpen', nếu không có mặc định là False
+                standby_servers = [s for s in servers_data if not s['health'].get('isOpen', False)]
+                triggered_scale_out = False 
 
                 for s_info in servers_data:
                     s_url = s_info['url']
                     h = s_info['health']
+                    
+                    # 1. LÀM SẠCH DỮ LIỆU (Tránh lỗi string "8.7%")
+                    try:
+                        raw_cpu = str(h.get('cpuUsagePercent', 0)).replace('%', '').strip()
+                        cpu_val = float(raw_cpu)
+                        raw_mem = str(h.get('memoryUsagePercent', 0)).replace('%', '').strip()
+                        mem_val = float(raw_mem)
+                    except:
+                        cpu_val = 0.0
+                        mem_val = 0.0
 
-                    # Mapping dữ liệu LBS sang định dạng AI học
-                    metrics = [0, 0, 0, h['cpuUsagePercent'], h['memoryUsagePercent'], 
-                               h['currConnections'], 0, 0, h['avgProcessingTimeSec'], 0]
+                    # Mapping metrics chuẩn cho AI
+                    metrics = [0, 0, 0, cpu_val, mem_val, h.get('currConnections', 0), 0, 0, h.get('avgProcessingTimeSec', 0), 0]
 
-                    # --- BẮT ĐẦU VÙNG AN TOÀN (CRITICAL SECTION) ---
-                    with self.lock: 
-                        # Trong khi đang dự đoán, không cho phép luồng Adaptive thay đổi ngưỡng
-                        is_overload, prob = self.brain.analyze_server(metrics)
-                        current_idle_threshold = self.brain.idle_threshold
-                    # --- KẾT THÚC VÙNG AN TOÀN ---
+                    # 2. PHÂN TÍCH (EMERGENCY + AI)
+                    is_overload = False
+                    prob = 0.0
+                    current_idle_threshold = 20.0
 
-                    # Logic ra lệnh
+                    # [LUẬT CỨNG] Nếu CPU > 95% -> Báo động đỏ ngay lập tức
+                    if cpu_val >= 95.0:
+                        is_overload = True
+                        prob = 1.0
+                        print(f"[🔥 EMERGENCY] {s_url} CPU {cpu_val}% -> Kích hoạt cứu viện!")
+                    else:
+                        # [LUẬT MỀM] Hỏi ý kiến AI
+                        with self.lock: 
+                            is_overload, prob = self.brain.analyze_server(metrics)
+                            current_idle_threshold = self.brain.idle_threshold
+
+                    # 3. RA QUYẾT ĐỊNH
                     cmd_action = None
+                    target_url = s_url # Mặc định tác động lên chính nó
 
                     if is_overload:
-                        cmd_action = "OPEN_SERVER"
-                    elif h['cpuUsagePercent'] < current_idle_threshold:
-                        is_protected = any(pid in s_url for pid in self.protected_servers)
-                        if is_protected:
-                            cmd_action = None
-                        else: 
-                            cmd_action = "CLOSE_SERVER"
+                        # LOGIC SCALE OUT: Server A quá tải -> Mở Server B (đang tắt)
+                        if not triggered_scale_out and len(standby_servers) > 0:
+                            savior = standby_servers.pop(0) # Lấy 1 server rảnh
+                            cmd_action = "OPEN_SERVER"
+                            target_url = savior['url']
+                            triggered_scale_out = True # Đánh dấu đã gọi cứu viện trong cycle này
+                            print(f"[🚑 SCALE UP] {s_url} quá tải ({prob:.1%}) -> Gọi {target_url} dậy!")
+                        elif len(standby_servers) == 0 and not triggered_scale_out:
+                            # print(f"[⚠️] {s_url} quá tải nhưng hết server dự phòng!")
+                            pass
 
-                    # Gửi lệnh ngay trên socket đang mở
+                    elif cpu_val < current_idle_threshold:
+                        # LOGIC SCALE DOWN: Server rảnh -> Tắt bớt (trừ server bảo vệ)
+                        is_open = h.get('isOpen', True)
+                        if is_open:
+                            # Kiểm tra "Thẻ bài miễn tử"
+                            is_protected = any(pid in s_url for pid in self.protected_identity)
+                            if not is_protected:
+                                cmd_action = "CLOSE_SERVER"
+                                # print(f"[📉 SCALE DOWN] {s_url} rảnh ({cpu_val}%) -> Tắt.")
+
+                    # 4. THỰC THI
                     if cmd_action:
                         current_action = cmd_action
-                        self.send_command(s_conn, cmd_action, s_url)
-                        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Decision: {cmd_action} -> {s_info['url']}")
+                        self.send_command(s_conn, cmd_action, target_url)
+                        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] CMD: {cmd_action} -> {target_url} (Prob: {prob:.2f})")
 
-                # Cập nhật hành động cuối để luồng Adaptive tham khảo
                 self.last_action = current_action
-                
-                # Đóng kết nối A
                 s_conn.close()
 
-            # Ngủ 10 giây
             time.sleep(10)
 
-
+    # --- HÀM 3: LUỒNG ADAPTIVE (5 Phút) ---
     def adaptive_cycle(self):
-        """Luồng chạy chậm 5 phút/lần để tự điều chỉnh ngưỡng"""
-        print("[*] Luồng Adaptive (5min) đã khởi động...")
-        
+        print("[*] Luồng Adaptive (5m) đã sẵn sàng.")
         while True:
-            # Ngủ 300 giây (5 phút) trước khi bắt đầu học
-            time.sleep(300)
+            time.sleep(300) # 5 Phút
+            print(f"\n[AI-LEARNING] Bắt đầu chu kỳ tự học lúc {datetime.datetime.now().strftime('%H:%M:%S')}...")
             
-            print(f"\n[{datetime.datetime.now().strftime('%H:%M:%S')}] --- BẮT ĐẦU TỰ HỌC ---")
-            
-            # 1. Gọi hàm chung để lấy dữ liệu (Kết nối độc lập B)
             payload, s_conn = self.get_lbs_status_connection()
-            
             if payload:
                 servers_data = payload.get('servers', [])
-                # Gom dữ liệu hiện tại của toàn bộ server
                 all_metrics_now = []
+                
                 for s in servers_data:
                     h = s['health']
-                    m = [0, 0, 0, h['cpuUsagePercent'], h['memoryUsagePercent'], 
-                         h['currConnections'], 0, 0, h['avgProcessingTimeSec'], 0]
+                    # Clean data trước khi học
+                    try:
+                        c = float(str(h.get('cpuUsagePercent',0)).replace('%',''))
+                    except: c = 0.0
+                    
+                    m = [0, 0, 0, c, 0, h.get('currConnections',0), 0, 0, 0, 0]
                     all_metrics_now.append(m)
 
-                # --- BẮT ĐẦU VÙNG AN TOÀN ---
                 with self.lock:
-                    # AI tự soi lại: "5 phút trước mình làm 'last_action', giờ hệ thống thế nào?"
                     self.brain.adjust_all_thresholds(all_metrics_now, self.last_action)
-                    print(f"[*] Đã học xong. Ngưỡng mới: CONF={self.brain.conf_threshold:.3f}, IDLE={self.brain.idle_threshold:.1f}%")
-                # --- KẾT THÚC VÙNG AN TOÀN ---
+                    print(f"[AI-LEARNING] Xong. Conf={self.brain.conf_threshold:.3f}, Idle={self.brain.idle_threshold:.1f}%")
             
-            if s_conn:
-                s_conn.close() # Kết nối B chỉ dùng để lấy data học, xong là đóng ngay
-            
-            print("--- KẾT THÚC TỰ HỌC ---\n")
+            if s_conn: s_conn.close()
+            print("[AI-LEARNING] Kết thúc.\n")
 
-
+    # --- UTILS ---
     def send_command(self, sock, action, url):
-        """Gửi lệnh điều khiển"""
         cmd = json.dumps({"action": action, "serverUrl": url}).encode('utf-8')
         sock.sendall(struct.pack('>I', len(cmd)) + cmd)
-        # Đọc xác nhận (nếu có) để tránh nghẽn buffer
-        r = self.recvall(sock, 4)
+        r = self.recvall(sock, 4) # Đọc confirm
         if r: self.recvall(sock, struct.unpack('>I', r)[0])
 
     def recvall(self, sock, n):
@@ -154,17 +174,12 @@ class AIProactiveAgent:
         return data
 
     def start(self):
-        # Khởi tạo 2 luồng riêng biệt
-        t_decision = threading.Thread(target=self.decision_cycle)
-        t_adaptive = threading.Thread(target=self.adaptive_cycle)
-        
-        # Chạy song song
-        t_decision.start()
-        t_adaptive.start()
-        
-        # Giữ main thread sống
-        t_decision.join()
-        t_adaptive.join()
+        t1 = threading.Thread(target=self.decision_cycle)
+        t2 = threading.Thread(target=self.adaptive_cycle)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
 
 if __name__ == "__main__":
     AIProactiveAgent().start()
