@@ -133,8 +133,8 @@ class AIProactiveAgent:
     def adaptive_cycle(self):
         print("[*] Luồng Adaptive (5m) đã sẵn sàng.")
         while True:
-            time.sleep(300) # 5 Phút
-            print(f"\n[AI-LEARNING] Bắt đầu chu kỳ tự học lúc {datetime.datetime.now().strftime('%H:%M:%S')}...")
+            # Ngủ 300 giây (5 phút) trước khi bắt đầu học
+            time.sleep(60)
             
             payload, s_conn = self.get_lbs_status_connection()
             if payload:

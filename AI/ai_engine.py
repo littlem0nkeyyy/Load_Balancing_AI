@@ -14,6 +14,9 @@ class AIBrain:
             self.conf_threshold = joblib.load(THRESHOLD_STATE_FILE) # take 0.1s to predict
         else:
             self.conf_threshold = DEFAULT_CONFIDENCE # immediately
+        
+        # Initialize idle_threshold
+        self.idle_threshold = DEFAULT_IDLE_THRESHOLD
     
     def load_state(self, filename, default_val):
         if os.path.exists(filename): return joblib.load(filename)
